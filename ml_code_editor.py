@@ -11,6 +11,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
 import pandas as pd
 from sklearn.datasets import make_classification, make_regression, load_iris, fetch_california_housing
 from sklearn.linear_model import LinearRegression, LogisticRegression
@@ -110,11 +111,45 @@ class MLCodeEditor:
         self.execution_globals = {}
         self.current_line = 0
         self.is_running = False
+        self.dev_focus = False
+        self.block_tag_map = {}
+        self.tooltip_window = None
+        self.canvas_scale = 1.0
+        self.is_panning = False
+        self.pan_start = (0, 0)
+
+        # Layers animation state (Conv→ReLU→Pool)
+        self.layers_grid_size = 28
+        self.layers_img = np.zeros((28, 28), dtype=float)
+        self.layers_anim_running = False
+        self.layers_anim_speed_ms = 120
+        self.layers_speed_var = tk.IntVar(value=120)
+        self.layers_conv_kernel = np.array([[1, 0, -1],
+                                            [1, 0, -1],
+                                            [1, 0, -1]], dtype=float)
+        self.layers_conv_map = None
+        self.layers_relu_map = None
+        self.layers_pool_map = None
+        self.layers_scan_index = 0
+        self.layers_scan_positions = []
+        self.layers_input_rect = None
+        self.layers_axes = {}
+        self.layers_fig = None
+        self.layers_plot_canvas = None
+        self.layers_pad_canvas = None
+        self.layers_tab = None
+        self.layers_flat = None
+        self.layers_dense_W = None
+        self.layers_dense_b = None
+        self.layers_logits = None
+        self.layers_probs = None
+        self.layers_dense_step = 0
         
         # Initialize execution environment
         self.setup_execution_environment()
         self.setup_ui()
         self.load_sample_code()
+        self.setup_keybindings()
     
     def setup_execution_environment(self):
         """Setup the execution environment with ML libraries"""
@@ -147,6 +182,7 @@ class MLCodeEditor:
         # Main container
         main_frame = tk.Frame(self.root, bg='#1e1e1e')
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.main_frame = main_frame
         
         # Top toolbar
         self.create_toolbar(main_frame)
@@ -154,6 +190,7 @@ class MLCodeEditor:
         # Main content area
         content_frame = tk.Frame(main_frame, bg='#1e1e1e')
         content_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.content_frame = content_frame
         
         # Create main panels
         self.create_library_explorer(content_frame)
@@ -168,6 +205,7 @@ class MLCodeEditor:
         """Create the top toolbar"""
         toolbar = tk.Frame(parent, bg='#2d2d2d', relief=tk.RAISED, bd=2)
         toolbar.pack(fill=tk.X, pady=(0, 5))
+        self.toolbar = toolbar
         
         # Control buttons
         tk.Button(toolbar, text="▶ Run Code", command=self.run_code,
@@ -195,6 +233,17 @@ class MLCodeEditor:
                                 font=('Consolas', 10),
                                 relief=tk.FLAT, padx=10)
         templates_btn.pack(side=tk.LEFT, padx=5)
+
+        # Dev Focus toggle
+        self.dev_focus_btn = tk.Button(toolbar, text="🎯 Dev Focus: OFF",
+                                       command=self.toggle_dev_focus,
+                                       bg='#3E3E3E', fg='white',
+                                       font=('Consolas', 10), relief=tk.FLAT, padx=10)
+        self.dev_focus_btn.pack(side=tk.LEFT, padx=5)
+
+        # Layers animation quick access
+        tk.Button(toolbar, text="🧠 Layers", command=self.open_layers_tab_and_run,
+                 bg='#795548', fg='white', font=('Arial', 12, 'bold')).pack(side=tk.LEFT, padx=5, pady=5)
         
         # 3D visualizer has been temporarily disabled per request
 
@@ -216,6 +265,7 @@ class MLCodeEditor:
         lib_frame = tk.Frame(parent, bg='#2b2b2b', width=250)
         lib_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
         lib_frame.pack_propagate(False)
+        self.lib_frame = lib_frame
         
         # Title
         title_label = tk.Label(lib_frame, text="📚 ML Libraries", 
@@ -847,6 +897,7 @@ class MLCodeEditor:
         """Create the code editor panel"""
         editor_frame = tk.Frame(parent, bg='#1e1e1e', relief=tk.RAISED, bd=2, width=400)
         editor_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        self.editor_frame = editor_frame
         
         tk.Label(editor_frame, text="💻 Python ML Code Editor", bg='#1e1e1e', fg='#4CAF50',
                 font=('Arial', 14, 'bold')).pack(pady=5)
@@ -917,16 +968,26 @@ class MLCodeEditor:
         
         # Draw grid
         self.draw_canvas_grid()
+        # Canvas interactions: zoom/pan
+        self.block_canvas.bind("<Control-MouseWheel>", self.on_canvas_zoom)
+        self.block_canvas.bind("<Button-2>", self.on_pan_start)
+        self.block_canvas.bind("<B2-Motion>", self.on_pan_move)
+        self.block_canvas.bind("<ButtonRelease-2>", self.on_pan_end)
+        self.block_canvas.bind("<Shift-Button-1>", self.on_pan_start)
+        self.block_canvas.bind("<Shift-B1-Motion>", self.on_pan_move)
+        self.block_canvas.bind("<Shift-ButtonRelease-1>", self.on_pan_end)
     
     def create_output_panel(self, parent):
         """Create the output and visualization panel"""
         output_frame = tk.Frame(parent, bg='#1e1e1e', relief=tk.RAISED, bd=2, width=400)
         output_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
         output_frame.pack_propagate(False)
+        self.output_frame = output_frame
         
         # Notebook for tabs
         notebook = ttk.Notebook(output_frame)
         notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.output_notebook = notebook
         
         # Visualization tab
         viz_tab = tk.Frame(notebook, bg='#1e1e1e')
@@ -965,12 +1026,19 @@ class MLCodeEditor:
         self.help_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
         self.load_help_content()
+
+        # Layers tab - CNN-style animation
+        layers_tab = tk.Frame(notebook, bg='#1e1e1e')
+        notebook.add(layers_tab, text="🧠 Layers")
+        self.layers_tab = layers_tab
+        self.init_layers_tab(layers_tab)
     
     def create_console_panel(self, parent):
         """Create the console panel"""
         console_frame = tk.Frame(parent, bg='#1e1e1e', relief=tk.RAISED, bd=2, height=200)
         console_frame.pack(fill=tk.X, pady=(10, 0))
         console_frame.pack_propagate(False)
+        self.console_frame = console_frame
         
         tk.Label(console_frame, text="🖥️ Console Output", bg='#1e1e1e', fg='#4CAF50',
                 font=('Arial', 12, 'bold')).pack(pady=5)
@@ -1001,6 +1069,361 @@ class MLCodeEditor:
         self.code_text.tag_configure("number", foreground="#B5CEA8")
         self.code_text.tag_configure("function", foreground="#DCDCAA")
         self.code_text.tag_configure("current_line", background="#2d4f67")
+
+    def setup_keybindings(self):
+        """Bind developer-friendly keyboard shortcuts"""
+        # Global shortcuts
+        self.root.bind('<F5>', lambda e: self.run_code())
+        self.root.bind('<F10>', lambda e: self.run_step_by_step())
+        self.root.bind('<Shift-F5>', lambda e: self.stop_execution())
+        self.root.bind('<F7>', lambda e: self.open_layers_tab_and_run())
+
+    # ==== Layers (Conv → ReLU → Pool) animation ====
+    def init_layers_tab(self, parent):
+        """Initialize Layers tab UI: draw pad and 2x2 plots."""
+        container = tk.Frame(parent, bg='#1e1e1e')
+        container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        left = tk.Frame(container, bg='#1e1e1e')
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
+        right = tk.Frame(container, bg='#1e1e1e')
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        tk.Label(left, text="✍️ Draw (28×28)", bg='#1e1e1e', fg='#4CAF50',
+                 font=('Arial', 12, 'bold')).pack(pady=(0, 5))
+
+        cell = 10
+        pad_size = self.layers_grid_size * cell
+        canvas = tk.Canvas(left, width=pad_size, height=pad_size, bg='black', highlightthickness=1, highlightbackground='#4a4a4a')
+        canvas.pack(pady=5)
+        self.layers_pad_canvas = canvas
+
+        # Draw grid
+        for i in range(self.layers_grid_size + 1):
+            x = i * cell
+            canvas.create_line(x, 0, x, pad_size, fill='#333333')
+            canvas.create_line(0, x, pad_size, x, fill='#333333')
+
+        # Bind drawing
+        canvas.bind('<Button-1>', lambda e: self.on_pad_draw(e, cell))
+        canvas.bind('<B1-Motion>', lambda e: self.on_pad_draw(e, cell))
+
+        # Controls
+        ctrl = tk.Frame(left, bg='#1e1e1e')
+        ctrl.pack(fill=tk.X, pady=5)
+        tk.Button(ctrl, text="🧹 Clear", command=self.clear_layers_pad,
+                 bg='#607D8B', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Button(ctrl, text="▶ Predict", command=self.run_layers_predict,
+                 bg='#4CAF50', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Label(ctrl, text="Speed (ms)", bg='#1e1e1e', fg='white').pack(side=tk.LEFT, padx=(10, 3))
+        tk.Scale(ctrl, from_=50, to=400, orient=tk.HORIZONTAL, variable=self.layers_speed_var,
+                 bg='#1e1e1e', fg='white', length=160, command=lambda v: self.set_layers_speed(int(float(v))))\
+            .pack(side=tk.LEFT, padx=3)
+
+        # 2x2 plots
+        self.layers_fig = Figure(figsize=(6.2, 5.4), dpi=80, facecolor='#2b2b2b')
+        # 2x2 trên cùng
+        ax1 = self.layers_fig.add_subplot(231)
+        ax2 = self.layers_fig.add_subplot(232)
+        ax3 = self.layers_fig.add_subplot(234)
+        ax4 = self.layers_fig.add_subplot(235)
+        # Ô phải dưới: xác suất 10 lớp
+        ax5 = self.layers_fig.add_subplot(233)
+        # Ô trái dưới: vector phẳng
+        ax6 = self.layers_fig.add_subplot(236)
+        for ax in (ax1, ax2, ax3, ax4):
+            ax.set_facecolor('#2b2b2b')
+            ax.tick_params(colors='white')
+        ax1.set_title('Input', color='white', fontsize=10)
+        ax2.set_title('Convolution', color='white', fontsize=10)
+        ax3.set_title('ReLU', color='white', fontsize=10)
+        ax4.set_title('Pooling 2×2', color='white', fontsize=10)
+        ax5.set_title('Output Prob (0-9)', color='white', fontsize=10)
+        ax6.set_title('Flatten', color='white', fontsize=10)
+        self.layers_axes = {'input': ax1, 'conv': ax2, 'relu': ax3, 'pool': ax4, 'out': ax5, 'flat': ax6}
+
+        self.layers_plot_canvas = FigureCanvasTkAgg(self.layers_fig, right)
+        self.layers_plot_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.update_layers_plots(reset=True)
+
+    def set_layers_speed(self, ms):
+        self.layers_anim_speed_ms = int(ms)
+
+    def clear_layers_pad(self):
+        self.layers_img[:] = 0
+        self.layers_pad_canvas.delete('paint')
+        # Redraw grid borders remain; repaint background
+        self.layers_pad_canvas.configure(bg='black')
+        self.update_layers_plots(reset=True)
+
+    def on_pad_draw(self, event, cell):
+        # Map mouse to grid cell
+        x, y = event.x, event.y
+        r = max(0, min(self.layers_grid_size - 1, y // cell))
+        c = max(0, min(self.layers_grid_size - 1, x // cell))
+        self.layers_img[r, c] = 1.0
+        # Paint the cell
+        x0, y0 = c * cell, r * cell
+        x1, y1 = x0 + cell, y0 + cell
+        self.layers_pad_canvas.create_rectangle(x0, y0, x1, y1, fill='white', outline='white', tags='paint')
+
+    def normalize(self, arr):
+        if arr is None:
+            return None
+        if np.all(arr == 0):
+            return arr
+        m, M = float(arr.min()), float(arr.max())
+        if M - m < 1e-9:
+            return np.zeros_like(arr)
+        return (arr - m) / (M - m)
+
+    def update_layers_plots(self, reset=False):
+        # Show current arrays
+        ax1, ax2, ax3, ax4 = self.layers_axes['input'], self.layers_axes['conv'], self.layers_axes['relu'], self.layers_axes['pool']
+        ax_out, ax_flat = self.layers_axes['out'], self.layers_axes['flat']
+        ax1.clear(); ax1.set_facecolor('#2b2b2b'); ax1.set_title('Input', color='white', fontsize=10)
+        ax2.clear(); ax2.set_facecolor('#2b2b2b'); ax2.set_title('Convolution', color='white', fontsize=10)
+        ax3.clear(); ax3.set_facecolor('#2b2b2b'); ax3.set_title('ReLU', color='white', fontsize=10)
+        ax4.clear(); ax4.set_facecolor('#2b2b2b'); ax4.set_title('Pooling 2×2', color='white', fontsize=10)
+        ax_out.clear(); ax_out.set_facecolor('#2b2b2b'); ax_out.set_title('Output Prob (0-9)', color='white', fontsize=10)
+        ax_flat.clear(); ax_flat.set_facecolor('#2b2b2b'); ax_flat.set_title('Flatten', color='white', fontsize=10)
+
+        ax1.imshow(self.layers_img, cmap='gray', vmin=0, vmax=1)
+        if reset:
+            self.layers_conv_map = np.zeros((self.layers_img.shape[0]-2, self.layers_img.shape[1]-2))
+            self.layers_relu_map = np.zeros_like(self.layers_conv_map)
+            self.layers_pool_map = np.zeros((self.layers_relu_map.shape[0]//2, self.layers_relu_map.shape[1]//2))
+            self.layers_flat = None
+            self.layers_logits = None
+            self.layers_probs = None
+        ax2.imshow(self.normalize(self.layers_conv_map), cmap='gray', vmin=0, vmax=1)
+        ax3.imshow(self.normalize(self.layers_relu_map), cmap='gray', vmin=0, vmax=1)
+        ax4.imshow(self.normalize(self.layers_pool_map), cmap='gray', vmin=0, vmax=1)
+
+        # Flatten view
+        if self.layers_flat is not None:
+            flat_vis = self.normalize(self.layers_flat)
+            ax_flat.imshow(flat_vis.reshape(1, -1), cmap='gray', aspect='auto', vmin=0, vmax=1)
+            ax_flat.get_yaxis().set_visible(False)
+            ax_flat.get_xaxis().set_visible(False)
+        else:
+            ax_flat.text(0.5, 0.5, 'Waiting for pool → flatten', color='white', ha='center', va='center', fontsize=9)
+
+        # Output probabilities
+        if self.layers_probs is not None:
+            digits = list(range(10))
+            ax_out.bar(digits, self.layers_probs, color='#4CAF50')
+            ax_out.set_xticks(digits)
+            ax_out.set_xticklabels([str(d) for d in digits], color='white')
+            ax_out.tick_params(axis='y', colors='white')
+            ax_out.set_ylim(0, 1)
+        else:
+            ax_out.text(0.5, 0.5, 'Waiting for dense → softmax', color='white', ha='center', va='center', fontsize=9)
+
+        self.layers_fig.tight_layout()
+        self.layers_plot_canvas.draw()
+
+    def conv2d_valid(self, img, kernel):
+        h, w = img.shape
+        kh, kw = kernel.shape
+        out = np.zeros((h - kh + 1, w - kw + 1))
+        for i in range(h - kh + 1):
+            for j in range(w - kw + 1):
+                region = img[i:i+kh, j:j+kw]
+                out[i, j] = float(np.sum(region * kernel))
+        return out
+
+    def max_pool_2x2(self, img):
+        h, w = img.shape
+        ph, pw = h // 2, w // 2
+        out = np.zeros((ph, pw))
+        for i in range(ph):
+            for j in range(pw):
+                region = img[2*i:2*i+2, 2*j:2*j+2]
+                out[i, j] = float(np.max(region))
+        return out
+
+    def open_layers_tab_and_run(self):
+        if self.layers_tab is not None:
+            try:
+                self.output_notebook.select(self.layers_tab)
+            except Exception:
+                pass
+        self.run_layers_predict()
+
+    def run_layers_predict(self):
+        # Prepare scanning sequence and arrays
+        self.layers_anim_running = True
+        self.layers_conv_map = np.zeros((self.layers_img.shape[0]-2, self.layers_img.shape[1]-2))
+        self.layers_relu_map = np.zeros_like(self.layers_conv_map)
+        self.layers_pool_map = np.zeros((self.layers_relu_map.shape[0]//2, self.layers_relu_map.shape[1]//2))
+
+        # Positions to scan (top-left of 3x3 windows)
+        h, w = self.layers_img.shape
+        self.layers_scan_positions = [(i, j) for i in range(h-2) for j in range(w-2)]
+        self.layers_scan_index = 0
+
+        # Add or reset scanning rectangle on input
+        ax1 = self.layers_axes['input']
+        if self.layers_input_rect is not None:
+            try:
+                self.layers_input_rect.remove()
+            except Exception:
+                pass
+        self.layers_input_rect = Rectangle((0, 0), 3, 3, linewidth=1.2, edgecolor='cyan', facecolor='none')
+        ax1.add_patch(self.layers_input_rect)
+
+        self.update_layers_plots(reset=True)
+        self.step_layers_animation()
+
+    def step_layers_animation(self):
+        if not self.layers_anim_running:
+            return
+        if self.layers_scan_index < len(self.layers_scan_positions):
+            i, j = self.layers_scan_positions[self.layers_scan_index]
+            # Compute one conv cell
+            val = float(np.sum(self.layers_img[i:i+3, j:j+3] * self.layers_conv_kernel))
+            self.layers_conv_map[i, j] = val
+            # Move rectangle
+            try:
+                self.layers_input_rect.set_xy((j, i))
+            except Exception:
+                pass
+            # Update plots
+            self.update_layers_plots(reset=False)
+            self.layers_scan_index += 1
+            self.root.after(self.layers_anim_speed_ms, self.step_layers_animation)
+        else:
+            # Finish: ReLU and Pool
+            self.layers_relu_map = np.maximum(self.layers_conv_map, 0)
+            self.layers_pool_map = self.max_pool_2x2(self.layers_relu_map)
+            self.update_layers_plots(reset=False)
+            self.layers_anim_running = False
+            # Proceed to dense + softmax visualization
+            self.run_dense_and_visualize()
+
+    def softmax(self, x):
+        x = np.asarray(x, dtype=float)
+        x = x - np.max(x)
+        exp_x = np.exp(x)
+        return exp_x / np.sum(exp_x)
+
+    def run_dense_and_visualize(self):
+        # Flatten after pooling
+        if self.layers_pool_map is None:
+            return
+        self.layers_flat = self.layers_pool_map.flatten()
+        n_features = self.layers_flat.size
+        # Init weights lazily and deterministically
+        if (self.layers_dense_W is None) or (self.layers_dense_W.shape[0] != n_features):
+            rng = np.random.default_rng(42)
+            self.layers_dense_W = rng.normal(0, 0.2, size=(n_features, 10))
+            self.layers_dense_b = rng.normal(0, 0.05, size=(10,))
+        # Compute logits and probs
+        self.layers_logits = self.layers_flat @ self.layers_dense_W + self.layers_dense_b
+        self.layers_probs = self.softmax(self.layers_logits)
+        # Simple reveal animation of bars
+        self.layers_dense_step = 0
+        self.reveal_prob_bars_step()
+
+    def reveal_prob_bars_step(self):
+        if self.layers_probs is None:
+            return
+        # Progressive display: set probs after step passes index
+        step = self.layers_dense_step
+        probs = np.zeros_like(self.layers_probs)
+        if step >= 10:
+            probs = self.layers_probs
+        else:
+            probs[:step] = self.layers_probs[:step]
+        # Temporarily assign and draw
+        prev = self.layers_probs
+        self.layers_probs = probs
+        self.update_layers_plots(reset=False)
+        # Restore full probs after drawing state, then schedule next
+        self.layers_probs = prev
+        if step < 10:
+            self.layers_dense_step += 1
+            self.root.after(self.layers_anim_speed_ms, self.reveal_prob_bars_step)
+        self.root.bind('<F9>', lambda e: self.toggle_dev_focus())
+        self.root.bind('<Control-s>', lambda e: self.save_code())
+        self.root.bind('<Control-o>', lambda e: self.load_code())
+        # Editor-specific
+        if hasattr(self, 'code_text'):
+            self.code_text.bind('<Control-Return>', lambda e: self.run_selection_or_line())
+
+    def toggle_dev_focus(self):
+        """Toggle Dev Focus mode: prioritize coding by hiding non-essential panels"""
+        self.dev_focus = not self.dev_focus
+        if self.dev_focus:
+            # Hide auxiliary panels
+            try:
+                self.lib_frame.pack_forget()
+            except Exception:
+                pass
+            try:
+                self.canvas_frame.pack_forget()
+            except Exception:
+                pass
+            try:
+                self.output_frame.pack_forget()
+            except Exception:
+                pass
+            # Ensure editor expands fully
+            self.editor_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+            # Update button
+            self.dev_focus_btn.configure(text="🎯 Dev Focus: ON", bg='#4CAF50')
+        else:
+            # Restore panels
+            self.lib_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
+            self.editor_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+            self.canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+            self.output_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+            self.dev_focus_btn.configure(text="🎯 Dev Focus: OFF", bg='#3E3E3E')
+
+    def run_selection_or_line(self):
+        """Run selected code or the current line"""
+        if self.is_running:
+            return
+        # Determine selection
+        try:
+            sel_ranges = self.code_text.tag_ranges("sel")
+            if sel_ranges:
+                snippet = self.code_text.get(sel_ranges[0], sel_ranges[1])
+            else:
+                line_start = self.code_text.index("insert linestart")
+                line_end = self.code_text.index("insert lineend")
+                snippet = self.code_text.get(line_start, line_end)
+        except Exception:
+            return
+
+        if not snippet.strip():
+            return
+
+        self.is_running = True
+        self.console_text.insert(tk.END, "⚡ Run snippet...\n", "info")
+        threading.Thread(target=lambda: self.execute_snippet(snippet), daemon=True).start()
+
+    def execute_snippet(self, snippet):
+        """Execute a code snippet (selection or single line)"""
+        try:
+            # Capture stdout
+            old_stdout = sys.stdout
+            sys.stdout = io.StringIO()
+            # Execute snippet in the same globals
+            exec(snippet, self.execution_globals)
+            # Get output
+            output = sys.stdout.getvalue()
+            sys.stdout = old_stdout
+            if output:
+                self.root.after(0, lambda: self.console_text.insert(tk.END, output, "output"))
+            # Update variables and plot
+            self.root.after(0, self.update_variables_display)
+            self.root.after(0, self.update_plot_display)
+        except Exception as e:
+            self.root.after(0, lambda: self.console_text.insert(tk.END, f"❌ Error: {str(e)}\n", "error"))
+        finally:
+            self.is_running = False
     
     def sync_scroll(self, *args):
         """Synchronize scrolling between code text and line numbers"""
@@ -1073,21 +1496,66 @@ class MLCodeEditor:
         self.block_canvas.delete("all")
         self.draw_canvas_grid()
         self.code_blocks.clear()
+        self.block_tag_map.clear()
         
-        # Analyze each line
+        # Column layout by code type
+        categories_order = [
+            'import', 'data_load', 'preprocessing', 'model',
+            'training', 'prediction', 'evaluation', 'visualization'
+        ]
+        col_x = {cat: 50 + idx * 170 for idx, cat in enumerate(categories_order)}
+        col_count = {cat: 0 for cat in categories_order}
         y_offset = 50
-        for i, line in enumerate(lines, 1):
-            line = line.strip()
-            if not line or line.startswith('#'):
+        i = 1
+        n = len(lines)
+        while i <= n:
+            line_stripped = lines[i-1].strip()
+            if not line_stripped or line_stripped.startswith('#'):
+                i += 1
                 continue
-            
-            code_type = self.classify_code_line(line)
-            if code_type != 'other':
-                x = 50 + (len(self.code_blocks) % 3) * 170
-                y = y_offset + (len(self.code_blocks) // 3) * 80
-                
+            code_type = self.classify_code_line(line_stripped)
+            # Group consecutive imports into one block
+            if code_type == 'import':
+                start_line = i
+                j = i + 1
+                while j <= n:
+                    next_line = lines[j-1].strip()
+                    if next_line and not next_line.startswith('#') and self.classify_code_line(next_line) == 'import':
+                        j += 1
+                    else:
+                        break
+                # Create one import block representing the range [start_line, j-1]
+                block_line_display = start_line if j == start_line + 1 else f"{start_line}-{j-1}"
+                x = col_x['import']
+                y = y_offset + col_count['import'] * 80
+                col_count['import'] += 1
+                block = CodeBlock(self.block_canvas, 'import', start_line, x, y)
+                # Override text to show range
+                display_text = f"Line {block_line_display}\nImport"
+                self.block_canvas.itemconfig(block.text_id, text=display_text)
+                self.code_blocks.append(block)
+                tag = f"block_{id(block)}"
+                self.block_tag_map[tag] = block
+                # Click scrolls to start of group
+                self.block_canvas.tag_bind(tag, "<Button-1>", lambda e, t=tag: self.handle_block_click(t))
+                # Hover shows all grouped import lines
+                self.block_canvas.tag_bind(tag, "<Enter>", lambda e, t=tag, s=start_line, e_line=j-1: self.handle_import_group_enter(t, e, s, e_line))
+                self.block_canvas.tag_bind(tag, "<Leave>", lambda e, t=tag: self.handle_block_leave(t))
+                i = j
+                continue
+            # Normal block for non-import types
+            if code_type in categories_order:
+                x = col_x[code_type]
+                y = y_offset + col_count[code_type] * 80
+                col_count[code_type] += 1
                 block = CodeBlock(self.block_canvas, code_type, i, x, y)
                 self.code_blocks.append(block)
+                tag = f"block_{id(block)}"
+                self.block_tag_map[tag] = block
+                self.block_canvas.tag_bind(tag, "<Button-1>", lambda e, t=tag: self.handle_block_click(t))
+                self.block_canvas.tag_bind(tag, "<Enter>", lambda e, t=tag: self.handle_block_enter(t, e))
+                self.block_canvas.tag_bind(tag, "<Leave>", lambda e, t=tag: self.handle_block_leave(t))
+            i += 1
         
         # Draw connections between blocks
         self.draw_block_connections()
@@ -1126,19 +1594,107 @@ class MLCodeEditor:
             self.block_canvas.create_line(0, i, 1000, i, fill='#3c3c3c', width=1)
     
     def draw_block_connections(self):
-        """Draw connections between blocks"""
+        """Draw connections between blocks with elbow lines"""
         for i in range(len(self.code_blocks) - 1):
             current_block = self.code_blocks[i]
             next_block = self.code_blocks[i + 1]
-            
-            # Draw arrow from current to next
-            start_x = current_block.x + current_block.width // 2
-            start_y = current_block.y + current_block.height
-            end_x = next_block.x + next_block.width // 2
-            end_y = next_block.y
-            
-            self.block_canvas.create_line(start_x, start_y, end_x, end_y,
-                                        fill='#4CAF50', width=2, arrow=tk.LAST)
+            sx = current_block.x + current_block.width // 2
+            sy = current_block.y + current_block.height
+            ex = next_block.x + next_block.width // 2
+            ey = next_block.y
+            mid_y = sy + 20
+            points = [sx, sy, sx, mid_y, ex, mid_y, ex, ey]
+            self.block_canvas.create_line(*points, fill='#4CAF50', width=2, arrow=tk.LAST)
+
+    def handle_block_click(self, tag):
+        """Handle block click: highlight block and related code line"""
+        block = self.block_tag_map.get(tag)
+        if not block:
+            return
+        for b in self.code_blocks:
+            b.unhighlight()
+        block.highlight()
+        self.highlight_current_line(block.line_number)
+        self.code_text.see(f"{block.line_number}.0")
+
+    def handle_block_enter(self, tag, event):
+        """Show tooltip with line content when hovering on block"""
+        block = self.block_tag_map.get(tag)
+        if not block:
+            return
+        line_text = self.code_text.get(f"{block.line_number}.0", f"{block.line_number}.end").strip()
+        content = f"Line {block.line_number}: {line_text}" if line_text else f"Line {block.line_number}"
+        if self.tooltip_window:
+            try:
+                self.tooltip_window.destroy()
+            except Exception:
+                pass
+        tw = tk.Toplevel(self.root)
+        tw.wm_overrideredirect(True)
+        x = event.x_root + 10
+        y = event.y_root + 10
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(tw, text=content, bg='#333333', fg='white', font=('Consolas', 10), bd=1, relief=tk.SOLID)
+        label.pack()
+        self.tooltip_window = tw
+
+    def handle_import_group_enter(self, tag, event, start_line, end_line):
+        """Tooltip for grouped import lines shows the full import range content"""
+        lines_content = []
+        for ln in range(start_line, end_line + 1):
+            text = self.code_text.get(f"{ln}.0", f"{ln}.end").strip()
+            if text:
+                lines_content.append(f"{ln}: {text}")
+        content = "\n".join(lines_content) if lines_content else f"Lines {start_line}-{end_line}"
+        if self.tooltip_window:
+            try:
+                self.tooltip_window.destroy()
+            except Exception:
+                pass
+        tw = tk.Toplevel(self.root)
+        tw.wm_overrideredirect(True)
+        x = event.x_root + 10
+        y = event.y_root + 10
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(tw, text=content, bg='#333333', fg='white', font=('Consolas', 10), bd=1, relief=tk.SOLID, justify=tk.LEFT)
+        label.pack()
+        self.tooltip_window = tw
+
+    def handle_block_leave(self, tag):
+        """Hide tooltip when leaving block"""
+        if self.tooltip_window:
+            try:
+                self.tooltip_window.destroy()
+            except Exception:
+                pass
+            self.tooltip_window = None
+
+    def on_canvas_zoom(self, event):
+        """Zoom canvas with Ctrl+MouseWheel"""
+        factor = 1.0
+        if event.delta > 0:
+            factor = 1.1
+        elif event.delta < 0:
+            factor = 0.9
+        self.canvas_scale *= factor
+        self.block_canvas.scale("all", event.x, event.y, factor, factor)
+        bbox = self.block_canvas.bbox("all")
+        if bbox:
+            self.block_canvas.configure(scrollregion=bbox)
+
+    def on_pan_start(self, event):
+        """Start panning the canvas"""
+        self.is_panning = True
+        self.block_canvas.scan_mark(event.x, event.y)
+
+    def on_pan_move(self, event):
+        """Continue panning the canvas"""
+        if self.is_panning:
+            self.block_canvas.scan_dragto(event.x, event.y, gain=1)
+
+    def on_pan_end(self, event):
+        """End panning the canvas"""
+        self.is_panning = False
     
     def custom_print(self, *args, **kwargs):
         """Custom print function to capture output"""
@@ -1863,12 +2419,17 @@ print(f"Accuracy: {accuracy:.3f}")
 • Step-by-step execution
 • Variable monitoring
 • Plot visualization
+• 🧠 Layers: CNN animation Input→Conv→ReLU→Pool
 
 ⌨️ SHORTCUTS:
 • Ctrl+S: Save code
 • Ctrl+O: Load code
 • F5: Run code
 • F10: Step by step
+• F7: Run Layers animation
+• F9: Toggle Dev Focus
+• Ctrl+Enter: Run selection/current line
+• Shift+F5: Stop execution
 
 🧩 SUPPORTED LIBRARIES:
 • NumPy (np)
@@ -1891,6 +2452,20 @@ print(f"Accuracy: {accuracy:.3f}")
 • Use meaningful variable names
 • Add comments for clarity
 • Test step by step for debugging
+
+🖱 BLOCK INTERACTION:
+• Click block: highlight và cuộn tới dòng code tương ứng
+• Hover block: hiển thị tooltip nội dung dòng code
+• Ctrl + Mouse Wheel: zoom canvas blocks
+• Middle mouse drag hoặc Shift + Drag: pan canvas
+
+🧠 LAYERS ANIMATION:
+• Mở tab "🧠 Layers" trên panel phải
+• Vẽ digit 28×28 ở ô bên trái
+• Nhấn ▶ Predict hoặc phím F7 để chạy
+• Quan sát 4 ô: Input → Conv → ReLU → Pool
+• Điều chỉnh tốc độ bằng thanh "Speed (ms)"
+• Nhấn 🧹 Clear để xoá và vẽ lại
 '''
         
         self.help_text.insert(1.0, help_content)
